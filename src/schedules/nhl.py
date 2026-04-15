@@ -37,10 +37,10 @@ class NHLSchedule(BaseSchedule):
 
             for week in data.get("gameWeek", []):
                 for game in week.get("games", []):
-                    raw_date = game.get("gameDate", "")
+                    raw_date = game.get("gameDate") or game.get("startTimeUTC", "")
                     try:
                         game_date = date.fromisoformat(raw_date[:10])
-                    except ValueError:
+                    except (ValueError, TypeError):
                         continue
 
                     if game_date < from_date or game_date > to_date:
