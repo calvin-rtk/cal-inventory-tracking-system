@@ -36,15 +36,17 @@ class NHLSchedule(BaseSchedule):
                 break
 
             for week in data.get("gameWeek", []):
-                for game in week.get("games", []):
-                    raw_date = game.get("gameDate") or game.get("startTimeUTC", "")
-                    try:
-                        game_date = date.fromisoformat(raw_date[:10])
-                    except (ValueError, TypeError):
-                        continue
+                # Use the week-level local date — avoids UTC-shift issues
+                # where a late West Coast game appears as the next calendar day.
+                try:
+                    game_date = date.fromisoformat(week["date"])
+                except (KeyError, ValueError):
+                    continue
 
-                    if game_date < from_date or game_date > to_date:
-                        continue
+                if game_date < from_date or game_date > to_date:
+                    continue
+
+                for game in week.get("games", []):
 
                     home_info = game.get("homeTeam", {})
                     away_info = game.get("awayTeam", {})
