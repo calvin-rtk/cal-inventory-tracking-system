@@ -15,7 +15,29 @@ def load_config() -> dict:
     if not config_path.exists():
         raise FileNotFoundError(f"config.yaml not found at {config_path}")
     with open(config_path, "r") as fh:
-        return yaml.safe_load(fh)
+        cfg = yaml.safe_load(fh)
+
+    # URLs are kept out of config.yaml and loaded from the environment
+    # so the repo can be public without leaking internal tool addresses.
+    load_dotenv(dotenv_path=_ROOT / ".env")
+
+    def _require_url(key: str) -> str:
+        val = os.getenv(key, "").strip().rstrip("/")
+        if not val:
+            raise EnvironmentError(
+                f"Missing URL environment variable: {key}\n"
+                "Add it to .env (local) or Streamlit secrets (cloud)."
+            )
+        return val
+
+    cfg["tools"]["sg"]["base_url"]   = _require_url("SG_BASE_URL")
+    cfg["tools"]["sg"]["login_url"]  = _require_url("SG_LOGIN_URL")
+    cfg["tools"]["sg"]["events_url"] = _require_url("SG_EVENTS_URL")
+    cfg["tools"]["te"]["base_url"]   = _require_url("TE_BASE_URL")
+    cfg["tools"]["te"]["login_url"]  = _require_url("TE_LOGIN_URL")
+    cfg["tools"]["te"]["events_url"] = _require_url("TE_EVENTS_URL")
+
+    return cfg
 
 
 def load_credentials() -> dict[str, dict[str, str]]:

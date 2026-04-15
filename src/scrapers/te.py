@@ -1,7 +1,7 @@
 """
 Scraper for the TE events-overview page.
 
-URL: https://tradeinternet.net/roman/te/events-overview.php
+URL is loaded from the TE_EVENTS_URL environment variable.
 
 Same table structure as the SG overview: Table #1 is the events data table
 with an 'event name' column that embeds the date in the cell text.

@@ -1,7 +1,7 @@
 """
 Scraper for the SG events-overview page.
 
-URL: https://tradeinternet.net/roman/sg/events-overview.php
+URL is loaded from the SG_EVENTS_URL environment variable.
 
 Expected page structure: an HTML table listing all current/future events with
 at minimum a date column and an event-name column.  Column layout is

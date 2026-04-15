@@ -7,9 +7,8 @@
 
 tools:
   sg:
-    base_url: https://tradeinternet.net/roman/sg
-    login_url: https://tradeinternet.net/roman/sg/login.html
-    events_url: https://tradeinternet.net/roman/sg/events-overview.php
+    # base_url / login_url / events_url are loaded from environment variables
+    # (SG_BASE_URL, SG_LOGIN_URL, SG_EVENTS_URL) — never stored here.
     form:
       username_field: txtEmailAddress
       password_field: txtPassword
@@ -28,10 +27,8 @@ tools:
       failure_marker: "Invalid"
 
   te:
-    base_url: https://tradeinternet.net/roman/te
-    login_url: https://tradeinternet.net/roman/te/login.html
-    # venues.php lists venue configs, not events — use events-overview instead
-    events_url: https://tradeinternet.net/roman/te/events-overview.php
+    # base_url / login_url / events_url are loaded from environment variables
+    # (TE_BASE_URL, TE_LOGIN_URL, TE_EVENTS_URL) — never stored here.
     form:
       username_field: txtEmailAddress
       password_field: txtPassword
