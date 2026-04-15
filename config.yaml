@@ -1,0 +1,65 @@
+# ============================================================
+# Tool Missing / 7's Checker — configuration
+# Run `python main.py discover` after adding credentials to
+# .env to print the exact table headers from each tool and
+# confirm / update the selector settings below.
+# ============================================================
+
+tools:
+  sg:
+    base_url: https://tradeinternet.net/roman/sg
+    login_url: https://tradeinternet.net/roman/sg/login.html
+    events_url: https://tradeinternet.net/roman/sg/events-overview.php
+    form:
+      username_field: txtEmailAddress
+      password_field: txtPassword
+    scraping:
+      table_selector: "table"
+      # Table #0 is the nav bar — skip it and use Table #1 (the events data)
+      table_index: 1
+      has_header_row: true
+      # Col 0 = row counter (#), Col 1 = event name (date embedded in text)
+      fallback_date_col: 1
+      fallback_event_col: 1
+      fallback_venue_col: 2
+      date_format: "%Y-%m-%d"
+    login_indicators:
+      success_marker: "events-overview"
+      failure_marker: "Invalid"
+
+  te:
+    base_url: https://tradeinternet.net/roman/te
+    login_url: https://tradeinternet.net/roman/te/login.html
+    # venues.php lists venue configs, not events — use events-overview instead
+    events_url: https://tradeinternet.net/roman/te/events-overview.php
+    form:
+      username_field: txtEmailAddress
+      password_field: txtPassword
+    scraping:
+      table_selector: "table"
+      table_index: 1
+      has_header_row: true
+      fallback_date_col: 1
+      fallback_event_col: 1
+      fallback_venue_col: 2
+      date_format: "%Y-%m-%d"
+    login_indicators:
+      success_marker: "events-overview"
+      failure_marker: "Invalid"
+
+# Official schedule date windows.
+# The app only checks games from today through season_end.
+schedules:
+  mlb:
+    season_end: "2026-10-04"
+  nhl:
+    season_end: "2026-06-30"
+  nba:
+    season_end: "2026-06-30"
+  nfl:
+    season_end: "2027-02-07"
+
+# Team-name matching settings
+matching:
+  # Minimum word length to use for fuzzy matching (avoids matching "at", "vs")
+  min_word_len: 4
