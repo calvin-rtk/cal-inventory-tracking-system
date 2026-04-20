@@ -3,17 +3,11 @@ Event Replicator — batch build and send event payloads to the TE API.
 """
 
 import json
+import os
 from collections import defaultdict
 
 import requests
 import streamlit as st
-
-try:
-    import psycopg2
-    import psycopg2.extras
-except ImportError:
-    st.error("psycopg2 not installed. Add psycopg2-binary to requirements.txt.")
-    st.stop()
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -29,29 +23,14 @@ st.title("🎟️ Event Replicator")
 st.caption("Build and send event payloads to the TE API.")
 
 # ---------------------------------------------------------------------------
-# DB connection — reads from Streamlit secrets, falls back to env vars
+# Go service base URL — reads from Streamlit secrets, falls back to env var
 # ---------------------------------------------------------------------------
 
-def get_conn():
+def get_base_url() -> str:
     try:
-        cfg = st.secrets["postgres"]
-        return psycopg2.connect(
-            host=cfg["host"],
-            port=int(cfg.get("port", 5432)),
-            dbname=cfg["dbname"],
-            user=cfg["user"],
-            password=cfg["password"],
-        )
+        return st.secrets["event_replicator"]["base_url"].rstrip("/")
     except (KeyError, FileNotFoundError):
-        import os
-        return psycopg2.connect(
-            host=os.environ.get("DB_HOST", "localhost"),
-            port=int(os.environ.get("DB_PORT", 5432)),
-            dbname=os.environ.get("DB_NAME", "postgres"),
-            user=os.environ.get("DB_USER", "postgres"),
-            password=os.environ.get("DB_PASSWORD", ""),
-        )
-
+        return os.environ.get("EVENT_REPLICATOR_BASE_URL", "http://localhost:8080").rstrip("/")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -79,96 +58,6 @@ def parse_event_name(start_date_est, event_name):
         except ValueError:
             pass
     return f"{raw} {event_name}"
-
-
-# ---------------------------------------------------------------------------
-# Batch SQL
-# ---------------------------------------------------------------------------
-
-BATCH_QUERY = """
-WITH
-target_events AS (
-    SELECT
-        e.id                          AS rtk_event_id,
-        e.name                        AS rtk_event_name,
-        e.start_date_est,
-        e.venue_id,
-        e.marketplaces,
-        v.sh_venue_id
-    FROM public.rtk_events_prod e
-    LEFT JOIN public.rtk_venues_prod v ON v.id = e.venue_id
-    WHERE e.id = ANY(%(event_ids)s)
-      AND e.deleted IS NOT TRUE
-),
-active_generic_ids AS (
-    SELECT DISTINCT generic_cohort_id AS id
-    FROM public.rtk_cohorts_prod
-    WHERE needs_deleted IS NOT TRUE AND generic_cohort_id IS NOT NULL
-),
-cohorts AS (
-    SELECT
-        c.cohort_id, c.cohort_name, c.event_id, c.is_parking,
-        c.pack_size, c.status, c.generic_cohort_id
-    FROM public.rtk_cohorts_prod c
-    JOIN target_events te ON te.rtk_event_id = c.event_id
-    WHERE c.needs_deleted IS NOT TRUE
-      AND (
-        (c.is_parking = true  AND c.pack_size = 1) OR
-        (c.is_parking = false AND c.pack_size = 2)
-      )
-),
-variant_sections AS (
-    SELECT
-        c.cohort_id,
-        g.name                                        AS variant_title,
-        string_agg(DISTINCT tm->>'name', ',')         AS must_have,
-        string_agg(DISTINCT sg->>'name', ',')         AS sg_must_have_section
-    FROM cohorts c
-    JOIN public.rtk_cohorts_generic_prod g ON g.id = c.generic_cohort_id
-    JOIN public.rtk_cohort_sections_prod cs ON cs.id = ANY(g.section_ids)
-    ,    jsonb_array_elements(cs.ticketmaster_sections) AS tm
-    ,    jsonb_array_elements(cs.seatgeek_sections) AS sg
-    WHERE cs.deleted_at IS NULL AND c.is_parking = false
-    GROUP BY c.cohort_id, g.name
-
-    UNION ALL
-
-    SELECT
-        c.cohort_id,
-        g.name                                        AS variant_title,
-        string_agg(DISTINCT tm->>'name', ',')         AS must_have,
-        string_agg(DISTINCT sg->>'name', ',')         AS sg_must_have_section
-    FROM cohorts c
-    JOIN target_events te ON te.rtk_event_id = c.event_id
-    JOIN public.rtk_cohorts_generic_prod g
-        ON g.venue_id = te.venue_id
-        AND lower(g.name) = lower(c.cohort_name)
-        AND g.id IN (SELECT id FROM active_generic_ids)
-    JOIN public.rtk_cohort_sections_prod cs ON cs.id = ANY(g.section_ids)
-    ,    jsonb_array_elements(cs.ticketmaster_sections) AS tm
-    ,    jsonb_array_elements(cs.seatgeek_sections) AS sg
-    WHERE cs.deleted_at IS NULL AND c.is_parking = true
-    GROUP BY c.cohort_id, g.name
-)
-SELECT
-    te.rtk_event_id,
-    te.rtk_event_name,
-    te.start_date_est,
-    te.marketplaces,
-    te.sh_venue_id,
-    c.cohort_id,
-    c.cohort_name,
-    c.is_parking,
-    c.pack_size,
-    c.status,
-    vs.variant_title,
-    vs.must_have,
-    vs.sg_must_have_section
-FROM target_events te
-JOIN cohorts c ON c.event_id = te.rtk_event_id
-LEFT JOIN variant_sections vs ON vs.cohort_id = c.cohort_id
-ORDER BY te.rtk_event_id, c.cohort_id;
-"""
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +112,23 @@ def build_payload(event_rows):
 
 
 # ---------------------------------------------------------------------------
+# Fetch from Go service
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_events(event_ids: tuple):
+    base_url = get_base_url()
+    url = f"{base_url}/venueMapping/v1/event-replicator/batch"
+    resp = requests.get(
+        url,
+        params={"event_ids": ",".join(str(i) for i in event_ids)},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["rows"]
+
+
+# ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
 
@@ -254,16 +160,6 @@ def parse_ids(raw):
             errors.append(t)
     return ids, errors
 
-# Fetch from DB
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_events(event_ids: tuple):
-    conn = get_conn()
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(BATCH_QUERY, {"event_ids": list(event_ids)})
-        rows = cur.fetchall()
-    conn.close()
-    return rows
-
 # Main logic
 if preview_btn or send_btn:
     event_ids, bad = parse_ids(raw_input)
@@ -274,11 +170,11 @@ if preview_btn or send_btn:
         st.error("No valid event IDs found.")
         st.stop()
 
-    with st.spinner(f"Querying database for {len(event_ids)} event(s)..."):
+    with st.spinner(f"Fetching {len(event_ids)} event(s) from service..."):
         try:
             all_rows = fetch_events(tuple(sorted(event_ids)))
         except Exception as e:
-            st.error(f"Database error: {e}")
+            st.error(f"Service error: {e}")
             st.stop()
 
     if not all_rows:
