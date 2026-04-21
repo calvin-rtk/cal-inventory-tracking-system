@@ -132,15 +132,40 @@ def fetch_events(event_ids: tuple):
 # UI
 # ---------------------------------------------------------------------------
 
-API_URL = "https://tradeinternet.net/roman/te/insert-event-api.php"
+TE_API_URL = "https://tradeinternet.net/roman/te/insert-event-api.php"
+SG_API_URL = "https://tradeinternet.net/roman/sg/insert-event-api.php"
 
-# Input
-st.subheader("Event IDs")
-raw_input = st.text_area(
-    "Paste one or more event IDs (one per line, or space/comma separated)",
-    height=120,
-    placeholder="51237\n54999\n55159",
-)
+# Input — separate boxes per destination tool so it's obvious which
+# nexus IDs get routed where. Each side processes independently.
+st.subheader("Nexus Event IDs")
+
+te_col, sg_col = st.columns(2)
+
+with te_col:
+    st.markdown("### 🟦 TE Tool")
+    st.caption(f"Posts to `{TE_API_URL}`")
+    te_raw_input = st.text_area(
+        "Nexus IDs for TE event adds",
+        height=140,
+        placeholder="51237\n54999\n55159",
+        key="te_event_ids",
+        help="One per line, or space/comma separated. Each ID produces one TE payload.",
+    )
+
+with sg_col:
+    st.markdown("### 🟩 SG Tool")
+    st.caption(f"Posts to `{SG_API_URL}`")
+    sg_raw_input = st.text_area(
+        "Nexus IDs for SG event adds",
+        height=140,
+        placeholder="41735\n...",
+        key="sg_event_ids",
+        help=(
+            "One per line, or space/comma separated. Each ID produces TWO SG "
+            "payloads: one for the main event and one for the parking event "
+            "(separate SG production IDs)."
+        ),
+    )
 
 col1, col2 = st.columns([1, 5])
 preview_btn = col1.button("🔍 Preview", use_container_width=True)
@@ -162,13 +187,32 @@ def parse_ids(raw):
 
 # Main logic
 if preview_btn or send_btn:
-    event_ids, bad = parse_ids(raw_input)
+    te_event_ids, te_bad = parse_ids(te_raw_input)
+    sg_event_ids, sg_bad = parse_ids(sg_raw_input)
 
-    if bad:
-        st.warning(f"Skipping non-integer values: {', '.join(bad)}")
-    if not event_ids:
-        st.error("No valid event IDs found.")
+    if te_bad:
+        st.warning(f"TE input — skipping non-integer values: {', '.join(te_bad)}")
+    if sg_bad:
+        st.warning(f"SG input — skipping non-integer values: {', '.join(sg_bad)}")
+
+    if not te_event_ids and not sg_event_ids:
+        st.error("No valid event IDs found in either the TE or SG box.")
         st.stop()
+
+    if sg_event_ids:
+        st.info(
+            f"SG tool support is not yet wired. Received {len(sg_event_ids)} "
+            f"SG ID(s): {sg_event_ids}. TE flow will run below if any TE IDs "
+            f"were provided."
+        )
+
+    if not te_event_ids:
+        # Nothing left to do until SG wiring lands.
+        st.stop()
+
+    # Preserve the existing single-ID-list variable name so the rest of the
+    # TE flow works unchanged.
+    event_ids = te_event_ids
 
     with st.spinner(f"Fetching {len(event_ids)} event(s) from service..."):
         try:
@@ -249,7 +293,7 @@ if preview_btn or send_btn:
 
             try:
                 response = requests.post(
-                    API_URL,
+                    TE_API_URL,
                     json=payload,
                     headers={"Content-Type": "application/json"},
                     timeout=30,
