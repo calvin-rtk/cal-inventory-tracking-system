@@ -127,6 +127,16 @@ def is_usable(r):
     return bool(r.get("variant_title")) and bool(r.get("sg_must_have_section"))
 
 
+def sg_section_list(raw):
+    """SG stores section slugs with hyphens standing in for spaces
+    (e.g. 'general-parking-lot', 'rate-club-a'). The SG tool expects
+    the human-readable form with spaces, so convert hyphens to spaces
+    per section name. Preserves the comma separator between sections."""
+    if not raw:
+        return ""
+    return ",".join(s.replace("-", " ") for s in raw.split(","))
+
+
 def sg_variant(r):
     is_parking = r["is_parking"]
     return {
@@ -137,7 +147,7 @@ def sg_variant(r):
         "minQty":             1 if is_parking else 2,
         "exactQty":           False,
         "ignoreTerms":        "",
-        "mustHave":           r.get("sg_must_have_section") or "",
+        "mustHave":           sg_section_list(r.get("sg_must_have_section")),
         "mustHaveRows":       "",
         "ignoreRows":         False,
         "exactMatchSections": True,
