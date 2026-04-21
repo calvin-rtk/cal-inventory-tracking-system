@@ -64,6 +64,16 @@ def parse_event_name(start_date_est, event_name):
 # Payload builder
 # ---------------------------------------------------------------------------
 
+def sg_section_list(raw):
+    """SG section slugs in the database use hyphens where spaces belong
+    (e.g. 'general-parking-lot', 'rate-club-a'). Both TE and SG tools
+    expect the human-readable form with spaces for their SG-section
+    fields. Applied per comma-separated section to preserve delimiters."""
+    if not raw:
+        return ""
+    return ",".join(s.replace("-", " ") for s in raw.split(","))
+
+
 def build_payload(event_rows):
     first = event_rows[0]
     mp = first["marketplaces"] or []
@@ -104,7 +114,7 @@ def build_payload(event_rows):
             "autoBuy":            False,
             "autoBuyPercentage":  8.0,
             "shMustHaveSection":  "",
-            "sgMustHaveSection":  r["sg_must_have_section"] or "",
+            "sgMustHaveSection":  sg_section_list(r["sg_must_have_section"]),
             "sendAlerts":         False,
         })
 
@@ -137,7 +147,7 @@ def sg_variant(r):
         "minQty":             1 if is_parking else 2,
         "exactQty":           False,
         "ignoreTerms":        "",
-        "mustHave":           r.get("sg_must_have_section") or "",
+        "mustHave":           sg_section_list(r.get("sg_must_have_section")),
         "mustHaveRows":       "",
         "ignoreRows":         False,
         "exactMatchSections": True,
