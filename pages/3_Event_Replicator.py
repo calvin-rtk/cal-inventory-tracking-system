@@ -112,6 +112,92 @@ def build_payload(event_rows):
 
 
 # ---------------------------------------------------------------------------
+# SG payload builders
+#
+# SG differs from TE:
+#   - Parking is a SEPARATE event with its own ProductionID (PARKING+seatgeek
+#     marketplace entry). So each nexus ID produces TWO payloads.
+#   - `mustHave` uses SG section names (sg_must_have_section) instead of TM.
+#   - Adds `teEventID` (tradedesk cross-ref) and `venueVariantID` fields.
+#   - Drops shParking/sgParking/vividParking event IDs on the main payload.
+# ---------------------------------------------------------------------------
+
+def is_usable(r):
+    """Skip cohorts whose generic has no section data ('- DELETED' ghosts)."""
+    return bool(r.get("variant_title")) and bool(r.get("sg_must_have_section"))
+
+
+def sg_variant(r):
+    is_parking = r["is_parking"]
+    return {
+        "variantTitle":       r.get("variant_title") or "",
+        "venueVariantID":     0,  # hardcoded per spec — tool requires field but we don't use it
+        "variantType":        3 if is_parking else 1,
+        "maxBuyPrice":        7,
+        "minQty":             1 if is_parking else 2,
+        "exactQty":           False,
+        "ignoreTerms":        "",
+        "mustHave":           r.get("sg_must_have_section") or "",
+        "mustHaveRows":       "",
+        "ignoreRows":         False,
+        "exactMatchSections": True,
+        "excludeWheelchair":  True,
+        "excludePiggyback":   True,
+        "excludeObstructed":  True,
+        "excludeStudent":     True,
+        "autoBuy":            False,
+        "autoBuyPercentage":  8.0,
+        "sendAlerts":         False,
+    }
+
+
+def build_sg_main_payload(event_rows):
+    first = event_rows[0]
+    mp = first["marketplaces"] or []
+    ticket_rows = [r for r in event_rows if not r["is_parking"] and is_usable(r)]
+    return {
+        "ProductionID":     mp_field(mp, "seatgeek"),
+        "teEventID":        mp_field(mp, "tradedesk"),
+        "eventName":        parse_event_name(first["start_date_est"], first["rtk_event_name"]),
+        "ZHEventID":        mp_field(mp, "zerohero"),
+        "shEventID":        mp_field(mp, "stubhub"),
+        "sgEventID":        mp_field(mp, "seatgeek"),
+        "vividEventID":     mp_field(mp, "vividseats"),
+        "shVenueID":        str(first["sh_venue_id"]) if first["sh_venue_id"] else "",
+        "taxRate":          0,
+        "profitPercentage": 0.08,
+        "variants":         [sg_variant(r) for r in ticket_rows],
+    }
+
+
+def build_sg_parking_payload(event_rows):
+    """Returns None if the event has no SG parking production ID."""
+    first = event_rows[0]
+    mp = first["marketplaces"] or []
+    parking_rows = [r for r in event_rows if r["is_parking"] and is_usable(r)]
+
+    if not parking_rows:
+        return None
+    sg_parking_prod = mp_field(mp, "PARKING", "seatgeek")
+    if not sg_parking_prod:
+        return None
+
+    return {
+        "ProductionID":     sg_parking_prod,
+        "teEventID":        mp_field(mp, "tradedesk"),  # fallback to main TE (TE has one ID for event+parking)
+        "eventName":        parse_event_name(first["start_date_est"], first["rtk_event_name"]) + " - PARKING",
+        "ZHEventID":        mp_field(mp, "PARKING", "zerohero"),
+        "shEventID":        mp_field(mp, "PARKING", "stubhub"),
+        "sgEventID":        mp_field(mp, "PARKING", "seatgeek"),
+        "vividEventID":     mp_field(mp, "PARKING", "vividseats"),
+        "shVenueID":        str(first["sh_venue_id"]) if first["sh_venue_id"] else "",
+        "taxRate":          0,
+        "profitPercentage": 0.08,
+        "variants":         [sg_variant(r) for r in parking_rows],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Fetch from Go service
 # ---------------------------------------------------------------------------
 
@@ -185,7 +271,32 @@ def parse_ids(raw):
             errors.append(t)
     return ids, errors
 
+def post_payload(url, payload):
+    """POST a single payload, return (ok_bool, status_code, text, processed)."""
+    try:
+        resp = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=60)
+        try:
+            js = resp.json()
+            processed = js.get("processed", "?")
+        except Exception:
+            processed = "?"
+        return resp.status_code, resp.text, processed
+    except requests.RequestException as e:
+        return None, str(e), "?"
+
+
+def group_rows(all_rows, event_ids):
+    by_event = defaultdict(list)
+    for row in all_rows:
+        by_event[row["rtk_event_id"]].append(row)
+    missing = set(event_ids) - set(by_event.keys())
+    return by_event, missing
+
+
+# ---------------------------------------------------------------------------
 # Main logic
+# ---------------------------------------------------------------------------
+
 if preview_btn or send_btn:
     te_event_ids, te_bad = parse_ids(te_raw_input)
     sg_event_ids, sg_bad = parse_ids(sg_raw_input)
@@ -199,24 +310,11 @@ if preview_btn or send_btn:
         st.error("No valid event IDs found in either the TE or SG box.")
         st.stop()
 
-    if sg_event_ids:
-        st.info(
-            f"SG tool support is not yet wired. Received {len(sg_event_ids)} "
-            f"SG ID(s): {sg_event_ids}. TE flow will run below if any TE IDs "
-            f"were provided."
-        )
-
-    if not te_event_ids:
-        # Nothing left to do until SG wiring lands.
-        st.stop()
-
-    # Preserve the existing single-ID-list variable name so the rest of the
-    # TE flow works unchanged.
-    event_ids = te_event_ids
-
-    with st.spinner(f"Fetching {len(event_ids)} event(s) from service..."):
+    # Fetch every unique ID once (cached), then slice per tool.
+    all_ids = sorted(set(te_event_ids) | set(sg_event_ids))
+    with st.spinner(f"Fetching {len(all_ids)} event(s) from service..."):
         try:
-            all_rows = fetch_events(tuple(sorted(event_ids)))
+            all_rows = fetch_events(tuple(all_ids))
         except Exception as e:
             st.error(f"Service error: {e}")
             st.stop()
@@ -225,97 +323,196 @@ if preview_btn or send_btn:
         st.error("No events found for the given IDs.")
         st.stop()
 
-    # Group by event
-    by_event = defaultdict(list)
-    for row in all_rows:
-        by_event[row["rtk_event_id"]].append(row)
+    by_event, global_missing = group_rows(all_rows, set(all_ids))
 
-    missing = set(event_ids) - set(by_event.keys())
-    if missing:
-        st.warning(f"No data found for event ID(s): {sorted(missing)}")
-
-    st.success(f"Found **{len(by_event)}** event(s) — **{len(all_rows)}** total variant rows")
-
-    # Build all payloads
-    payloads = {eid: build_payload(rows) for eid, rows in by_event.items()}
-
-    # Preview section
-    st.divider()
-    for event_id in event_ids:
-        if event_id not in payloads:
-            continue
-
-        payload = payloads[event_id]
-        tickets  = [v for v in payload["variants"] if v["variantType"] == 1]
-        parking  = [v for v in payload["variants"] if v["variantType"] == 3]
-
-        with st.expander(f"**{payload['eventName']}** — {len(payload['variants'])} variants", expanded=False):
-            m = st.columns(4)
-            m[0].metric("ProductionID",  payload["ProductionID"] or "—")
-            m[1].metric("SH Event",      payload["shEventID"] or "—")
-            m[2].metric("SG Event",      payload["sgEventID"] or "—")
-            m[3].metric("Vivid Event",   payload["vividEventID"] or "—")
-
-            if tickets:
-                st.markdown("**🎫 Ticket Variants**")
-                st.dataframe(
-                    [{"Zone": v["variantTitle"], "mustHave": v["mustHave"], "sgMustHave": v["sgMustHaveSection"]} for v in tickets],
-                    use_container_width=True, hide_index=True,
-                )
-            if parking:
-                st.markdown("**🚗 Parking Variants**")
-                st.dataframe(
-                    [{"Zone": v["variantTitle"], "mustHave": v["mustHave"], "sgMustHave": v["sgMustHaveSection"]} for v in parking],
-                    use_container_width=True, hide_index=True,
-                )
-
-            # JSON download
-            st.download_button(
-                label="⬇️ Download payload JSON",
-                data=json.dumps(payload, indent=2),
-                file_name=f"event_{payload['ProductionID'] or event_id}_payload.json",
-                mime="application/json",
-            )
-
-    # Send section
-    if send_btn:
+    # -----------------------------------------------------------------------
+    # TE tool
+    # -----------------------------------------------------------------------
+    if te_event_ids:
         st.divider()
-        st.subheader("API Results")
+        st.header("🟦 TE Tool")
 
-        summary = {"success": [], "already_exists": [], "error": []}
+        te_missing = set(te_event_ids) & global_missing
+        if te_missing:
+            st.warning(f"TE — no data for event ID(s): {sorted(te_missing)}")
 
-        for event_id in event_ids:
-            if event_id not in payloads:
+        te_payloads = {eid: build_payload(by_event[eid]) for eid in te_event_ids if eid in by_event}
+        st.success(f"Built {len(te_payloads)} TE payload(s)")
+
+        for event_id in te_event_ids:
+            payload = te_payloads.get(event_id)
+            if not payload:
                 continue
+            tickets = [v for v in payload["variants"] if v["variantType"] == 1]
+            parking = [v for v in payload["variants"] if v["variantType"] == 3]
 
-            payload = payloads[event_id]
-            event_name = payload["eventName"]
+            with st.expander(f"**{payload['eventName']}** — {len(payload['variants'])} variants", expanded=False):
+                m = st.columns(4)
+                m[0].metric("ProductionID", payload["ProductionID"] or "—")
+                m[1].metric("SH Event",     payload["shEventID"] or "—")
+                m[2].metric("SG Event",     payload["sgEventID"] or "—")
+                m[3].metric("Vivid Event",  payload["vividEventID"] or "—")
 
-            try:
-                response = requests.post(
-                    TE_API_URL,
-                    json=payload,
-                    headers={"Content-Type": "application/json"},
-                    timeout=30,
+                if tickets:
+                    st.markdown("**🎫 Ticket Variants**")
+                    st.dataframe(
+                        [{"Zone": v["variantTitle"], "mustHave": v["mustHave"], "sgMustHave": v["sgMustHaveSection"]} for v in tickets],
+                        use_container_width=True, hide_index=True,
+                    )
+                if parking:
+                    st.markdown("**🚗 Parking Variants**")
+                    st.dataframe(
+                        [{"Zone": v["variantTitle"], "mustHave": v["mustHave"], "sgMustHave": v["sgMustHaveSection"]} for v in parking],
+                        use_container_width=True, hide_index=True,
+                    )
+
+                st.download_button(
+                    label="⬇️ Download TE payload JSON",
+                    data=json.dumps(payload, indent=2),
+                    file_name=f"event_{payload['ProductionID'] or event_id}_te_payload.json",
+                    mime="application/json",
+                    key=f"te_dl_{event_id}",
                 )
 
-                if response.status_code == 200:
-                    st.success(f"✅ **{event_name}** — {response.json().get('processed', '?')} variants processed")
-                    summary["success"].append(event_id)
-                elif response.status_code == 400:
-                    st.warning(f"⚠️ **{event_name}** — Event already exists in the web service")
-                    summary["already_exists"].append(event_id)
+        if send_btn and te_payloads:
+            st.subheader("TE API Results")
+            summary = {"success": 0, "already_exists": 0, "error": 0}
+            for event_id in te_event_ids:
+                payload = te_payloads.get(event_id)
+                if not payload:
+                    continue
+                status, body, processed = post_payload(TE_API_URL, payload)
+                event_name = payload["eventName"]
+                if status == 200:
+                    st.success(f"✅ **{event_name}** — {processed} variants processed")
+                    summary["success"] += 1
+                elif status == 400:
+                    st.warning(f"⚠️ **{event_name}** — already exists")
+                    summary["already_exists"] += 1
                 else:
-                    st.error(f"❌ **{event_name}** — HTTP {response.status_code}: {response.text}")
-                    summary["error"].append(event_id)
+                    st.error(f"❌ **{event_name}** — HTTP {status}: {body}")
+                    summary["error"] += 1
+            c1, c2, c3 = st.columns(3)
+            c1.metric("✅ Sent",            summary["success"])
+            c2.metric("⚠️ Already Existed", summary["already_exists"])
+            c3.metric("❌ Errors",           summary["error"])
 
-            except requests.RequestException as e:
-                st.error(f"❌ **{event_name}** — Request failed: {e}")
-                summary["error"].append(event_id)
-
-        # Summary
+    # -----------------------------------------------------------------------
+    # SG tool — two payloads per event (main + parking)
+    # -----------------------------------------------------------------------
+    if sg_event_ids:
         st.divider()
-        c1, c2, c3 = st.columns(3)
-        c1.metric("✅ Sent",            len(summary["success"]))
-        c2.metric("⚠️ Already Existed", len(summary["already_exists"]))
-        c3.metric("❌ Errors",           len(summary["error"]))
+        st.header("🟩 SG Tool")
+
+        sg_missing = set(sg_event_ids) & global_missing
+        if sg_missing:
+            st.warning(f"SG — no data for event ID(s): {sorted(sg_missing)}")
+
+        sg_payloads = {}  # eid -> {"main": {...}, "parking": {...} or None}
+        for eid in sg_event_ids:
+            if eid not in by_event:
+                continue
+            rows = by_event[eid]
+            sg_payloads[eid] = {
+                "main":    build_sg_main_payload(rows),
+                "parking": build_sg_parking_payload(rows),
+            }
+
+        built_parking = sum(1 for p in sg_payloads.values() if p["parking"])
+        st.success(
+            f"Built {len(sg_payloads)} SG main payload(s) and "
+            f"{built_parking} parking payload(s)"
+        )
+
+        for event_id in sg_event_ids:
+            bundle = sg_payloads.get(event_id)
+            if not bundle:
+                continue
+            main_p = bundle["main"]
+            parking_p = bundle["parking"]
+
+            label = f"**{main_p['eventName']}** — {len(main_p['variants'])} main"
+            if parking_p:
+                label += f" + {len(parking_p['variants'])} parking"
+            else:
+                label += " (no parking payload)"
+
+            with st.expander(label, expanded=False):
+                m = st.columns(4)
+                m[0].metric("SG ProductionID", main_p["ProductionID"] or "—")
+                m[1].metric("teEventID",       main_p["teEventID"] or "—")
+                m[2].metric("SH Event",        main_p["shEventID"] or "—")
+                m[3].metric("Vivid Event",     main_p["vividEventID"] or "—")
+
+                if main_p["variants"]:
+                    st.markdown("**🎫 Main Variants**")
+                    st.dataframe(
+                        [{"Zone": v["variantTitle"], "type": v["variantType"], "mustHave (SG)": v["mustHave"]} for v in main_p["variants"]],
+                        use_container_width=True, hide_index=True,
+                    )
+
+                st.download_button(
+                    label="⬇️ Download SG main payload JSON",
+                    data=json.dumps(main_p, indent=2),
+                    file_name=f"event_{event_id}_sg_main_payload.json",
+                    mime="application/json",
+                    key=f"sg_main_dl_{event_id}",
+                )
+
+                if parking_p:
+                    st.markdown("---")
+                    mp2 = st.columns(3)
+                    mp2[0].metric("SG Parking ProductionID", parking_p["ProductionID"] or "—")
+                    mp2[1].metric("SH Parking Event",        parking_p["shEventID"] or "—")
+                    mp2[2].metric("SG Parking Event",        parking_p["sgEventID"] or "—")
+
+                    st.markdown("**🚗 Parking Variants**")
+                    st.dataframe(
+                        [{"Zone": v["variantTitle"], "type": v["variantType"], "mustHave (SG)": v["mustHave"]} for v in parking_p["variants"]],
+                        use_container_width=True, hide_index=True,
+                    )
+                    st.download_button(
+                        label="⬇️ Download SG parking payload JSON",
+                        data=json.dumps(parking_p, indent=2),
+                        file_name=f"event_{event_id}_sg_parking_payload.json",
+                        mime="application/json",
+                        key=f"sg_park_dl_{event_id}",
+                    )
+                else:
+                    st.info(
+                        "No parking payload built for this event — either there are no "
+                        "parking cohorts or the event lacks a PARKING+seatgeek "
+                        "marketplace ID."
+                    )
+
+        if send_btn and sg_payloads:
+            st.subheader("SG API Results")
+            summary = {"success": 0, "already_exists": 0, "error": 0, "skipped": 0}
+
+            for event_id in sg_event_ids:
+                bundle = sg_payloads.get(event_id)
+                if not bundle:
+                    continue
+
+                for kind, payload in (("main", bundle["main"]), ("parking", bundle["parking"])):
+                    if payload is None:
+                        st.info(f"⏭️ Event {event_id} — no {kind} payload to send")
+                        summary["skipped"] += 1
+                        continue
+                    status, body, processed = post_payload(SG_API_URL, payload)
+                    label = f"{payload['eventName']} [{kind.upper()}]"
+                    if status == 200:
+                        st.success(f"✅ **{label}** — {processed} variants processed")
+                        summary["success"] += 1
+                    elif status == 400:
+                        st.warning(f"⚠️ **{label}** — already exists")
+                        summary["already_exists"] += 1
+                    else:
+                        st.error(f"❌ **{label}** — HTTP {status}: {body}")
+                        summary["error"] += 1
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("✅ Sent",            summary["success"])
+            c2.metric("⚠️ Already Existed", summary["already_exists"])
+            c3.metric("❌ Errors",           summary["error"])
+            c4.metric("⏭️ Skipped",          summary["skipped"])
