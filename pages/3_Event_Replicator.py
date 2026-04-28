@@ -64,13 +64,19 @@ def parse_event_name(start_date_est, event_name):
 # Payload builder
 # ---------------------------------------------------------------------------
 
-def sg_section_list(raw):
+def sg_section_list(raw, is_parking=False):
     """SG section slugs in the database use hyphens where spaces belong
-    (e.g. 'general-parking-lot', 'rate-club-a'). Both TE and SG tools
-    expect the human-readable form with spaces for their SG-section
-    fields. Applied per comma-separated section to preserve delimiters."""
+    for ticket sections (e.g. 'rate-club-a' -> 'rate club a'). Both TE
+    and SG tools expect the human-readable form with spaces for ticket
+    variants.
+
+    Parking variants (variantType=3) keep the raw hyphenated slug
+    (e.g. 'parking-lot-b' stays as-is) — that's the format the SG/TE
+    parking matchers expect."""
     if not raw:
         return ""
+    if is_parking:
+        return raw
     return ",".join(s.replace("-", " ") for s in raw.split(","))
 
 
@@ -114,7 +120,7 @@ def build_payload(event_rows):
             "autoBuy":            False,
             "autoBuyPercentage":  8.0,
             "shMustHaveSection":  "",
-            "sgMustHaveSection":  sg_section_list(r["sg_must_have_section"]),
+            "sgMustHaveSection":  sg_section_list(r["sg_must_have_section"], is_parking=is_parking),
             "sendAlerts":         False,
         })
 
@@ -147,7 +153,7 @@ def sg_variant(r):
         "minQty":             1 if is_parking else 2,
         "exactQty":           False,
         "ignoreTerms":        "",
-        "mustHave":           sg_section_list(r.get("sg_must_have_section")),
+        "mustHave":           sg_section_list(r.get("sg_must_have_section"), is_parking=is_parking),
         "mustHaveRows":       "",
         "ignoreRows":         False,
         "exactMatchSections": True,
@@ -281,6 +287,48 @@ def parse_ids(raw):
             errors.append(t)
     return ids, errors
 
+# ---------------------------------------------------------------------------
+# Preflight validation
+#
+# Each tool requires a non-empty ProductionID before we POST. Without one,
+# the destination tool can silently accept the payload and create or attach
+# garbage records (we hit this on event 55360 — no tradedesk marketplace
+# entry, so ProductionID was empty and the TE tool stamped an unrelated
+# production ID onto the alerts).
+# ---------------------------------------------------------------------------
+
+def validate_te(payload):
+    """Return list of blocking-error strings for a TE payload (empty == OK)."""
+    errors = []
+    if not payload.get("ProductionID"):
+        errors.append(
+            "missing tradedesk marketplace ID (TE ProductionID is empty) — "
+            "verify the TE production ID is attached to this event in the "
+            "alerts system before retrying"
+        )
+    return errors
+
+
+def validate_sg_main(payload):
+    errors = []
+    if not payload.get("ProductionID"):
+        errors.append(
+            "missing seatgeek marketplace ID (SG main ProductionID is empty) — "
+            "verify the SG event has a seatgeek production ID attached"
+        )
+    return errors
+
+
+def validate_sg_parking(payload):
+    errors = []
+    if not payload.get("ProductionID"):
+        errors.append(
+            "missing PARKING+seatgeek marketplace ID — parking event cannot "
+            "be created without an SG parking production ID"
+        )
+    return errors
+
+
 def post_payload(url, payload):
     """POST a single payload, return (ok_bool, status_code, text, processed)."""
     try:
@@ -347,16 +395,33 @@ if preview_btn or send_btn:
             st.warning(f"TE — no data for event ID(s): {sorted(te_missing)}")
 
         te_payloads = {eid: build_payload(by_event[eid]) for eid in te_event_ids if eid in by_event}
-        st.success(f"Built {len(te_payloads)} TE payload(s)")
+        # Validate every payload up front so the user sees blocking errors
+        # before they click Send. Errors-by-event keyed for fast lookup.
+        te_errors = {eid: validate_te(p) for eid, p in te_payloads.items()}
+        te_blocked = {eid for eid, errs in te_errors.items() if errs}
+
+        ok_count = len(te_payloads) - len(te_blocked)
+        if te_blocked:
+            st.error(
+                f"⛔ {len(te_blocked)} of {len(te_payloads)} TE payload(s) "
+                f"have blocking errors and will NOT be sent: "
+                f"{sorted(te_blocked)}"
+            )
+        st.success(f"Built {len(te_payloads)} TE payload(s) — {ok_count} ready to send")
 
         for event_id in te_event_ids:
             payload = te_payloads.get(event_id)
             if not payload:
                 continue
+            errs = te_errors.get(event_id, [])
             tickets = [v for v in payload["variants"] if v["variantType"] == 1]
             parking = [v for v in payload["variants"] if v["variantType"] == 3]
 
-            with st.expander(f"**{payload['eventName']}** — {len(payload['variants'])} variants", expanded=False):
+            badge = "⛔ BLOCKED " if errs else ""
+            with st.expander(f"{badge}**{payload['eventName']}** — {len(payload['variants'])} variants", expanded=bool(errs)):
+                if errs:
+                    for e in errs:
+                        st.error(f"❌ Event {event_id}: {e}")
                 m = st.columns(4)
                 m[0].metric("ProductionID", payload["ProductionID"] or "—")
                 m[1].metric("SH Event",     payload["shEventID"] or "—")
@@ -386,10 +451,15 @@ if preview_btn or send_btn:
 
         if send_btn and te_payloads:
             st.subheader("TE API Results")
-            summary = {"success": 0, "already_exists": 0, "error": 0}
+            summary = {"success": 0, "already_exists": 0, "error": 0, "skipped": 0}
             for event_id in te_event_ids:
                 payload = te_payloads.get(event_id)
                 if not payload:
+                    continue
+                if event_id in te_blocked:
+                    reason = "; ".join(te_errors[event_id])
+                    st.error(f"⛔ **Event {event_id}** — skipped (validation): {reason}")
+                    summary["skipped"] += 1
                     continue
                 status, body, processed = post_payload(TE_API_URL, payload)
                 event_name = payload["eventName"]
@@ -402,10 +472,11 @@ if preview_btn or send_btn:
                 else:
                     st.error(f"❌ **{event_name}** — HTTP {status}: {body}")
                     summary["error"] += 1
-            c1, c2, c3 = st.columns(3)
+            c1, c2, c3, c4 = st.columns(4)
             c1.metric("✅ Sent",            summary["success"])
             c2.metric("⚠️ Already Existed", summary["already_exists"])
             c3.metric("❌ Errors",           summary["error"])
+            c4.metric("⛔ Skipped",          summary["skipped"])
 
     # -----------------------------------------------------------------------
     # SG tool — two payloads per event (main + parking)
@@ -419,16 +490,29 @@ if preview_btn or send_btn:
             st.warning(f"SG — no data for event ID(s): {sorted(sg_missing)}")
 
         sg_payloads = {}  # eid -> {"main": {...}, "parking": {...} or None}
+        sg_errors   = {}  # eid -> {"main": [...], "parking": [...]}
         for eid in sg_event_ids:
             if eid not in by_event:
                 continue
             rows = by_event[eid]
-            sg_payloads[eid] = {
-                "main":    build_sg_main_payload(rows),
-                "parking": build_sg_parking_payload(rows),
+            main_p    = build_sg_main_payload(rows)
+            parking_p = build_sg_parking_payload(rows)
+            sg_payloads[eid] = {"main": main_p, "parking": parking_p}
+            sg_errors[eid] = {
+                "main":    validate_sg_main(main_p),
+                "parking": validate_sg_parking(parking_p) if parking_p else [],
             }
 
+        sg_blocked_main    = {eid for eid, errs in sg_errors.items() if errs["main"]}
+        sg_blocked_parking = {eid for eid, errs in sg_errors.items() if sg_payloads[eid]["parking"] and errs["parking"]}
         built_parking = sum(1 for p in sg_payloads.values() if p["parking"])
+
+        if sg_blocked_main or sg_blocked_parking:
+            blocks = []
+            if sg_blocked_main:    blocks.append(f"main: {sorted(sg_blocked_main)}")
+            if sg_blocked_parking: blocks.append(f"parking: {sorted(sg_blocked_parking)}")
+            st.error(f"⛔ Blocked SG payload(s): " + " | ".join(blocks))
+
         st.success(
             f"Built {len(sg_payloads)} SG main payload(s) and "
             f"{built_parking} parking payload(s)"
@@ -441,13 +525,25 @@ if preview_btn or send_btn:
             main_p = bundle["main"]
             parking_p = bundle["parking"]
 
+            errs_main    = sg_errors[event_id]["main"]
+            errs_parking = sg_errors[event_id]["parking"]
+            any_block = bool(errs_main) or bool(errs_parking)
+
             label = f"**{main_p['eventName']}** — {len(main_p['variants'])} main"
             if parking_p:
                 label += f" + {len(parking_p['variants'])} parking"
             else:
                 label += " (no parking payload)"
+            if any_block:
+                label = "⛔ BLOCKED " + label
 
-            with st.expander(label, expanded=False):
+            with st.expander(label, expanded=any_block):
+                if errs_main:
+                    for e in errs_main:
+                        st.error(f"❌ Event {event_id} [MAIN]: {e}")
+                if errs_parking:
+                    for e in errs_parking:
+                        st.error(f"❌ Event {event_id} [PARKING]: {e}")
                 m = st.columns(4)
                 m[0].metric("SG ProductionID", main_p["ProductionID"] or "—")
                 m[1].metric("teEventID",       main_p["teEventID"] or "—")
@@ -497,7 +593,7 @@ if preview_btn or send_btn:
 
         if send_btn and sg_payloads:
             st.subheader("SG API Results")
-            summary = {"success": 0, "already_exists": 0, "error": 0, "skipped": 0}
+            summary = {"success": 0, "already_exists": 0, "error": 0, "skipped": 0, "blocked": 0}
 
             for event_id in sg_event_ids:
                 bundle = sg_payloads.get(event_id)
@@ -508,6 +604,12 @@ if preview_btn or send_btn:
                     if payload is None:
                         st.info(f"⏭️ Event {event_id} — no {kind} payload to send")
                         summary["skipped"] += 1
+                        continue
+                    errs = sg_errors[event_id][kind]
+                    if errs:
+                        reason = "; ".join(errs)
+                        st.error(f"⛔ **Event {event_id} [{kind.upper()}]** — skipped (validation): {reason}")
+                        summary["blocked"] += 1
                         continue
                     status, body, processed = post_payload(SG_API_URL, payload)
                     label = f"{payload['eventName']} [{kind.upper()}]"
@@ -521,8 +623,9 @@ if preview_btn or send_btn:
                         st.error(f"❌ **{label}** — HTTP {status}: {body}")
                         summary["error"] += 1
 
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("✅ Sent",            summary["success"])
-            c2.metric("⚠️ Already Existed", summary["already_exists"])
-            c3.metric("❌ Errors",           summary["error"])
-            c4.metric("⏭️ Skipped",          summary["skipped"])
+            cols = st.columns(5)
+            cols[0].metric("✅ Sent",            summary["success"])
+            cols[1].metric("⚠️ Already Existed", summary["already_exists"])
+            cols[2].metric("❌ Errors",           summary["error"])
+            cols[3].metric("⛔ Blocked",          summary["blocked"])
+            cols[4].metric("⏭️ Skipped",          summary["skipped"])
