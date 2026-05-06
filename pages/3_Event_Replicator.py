@@ -411,39 +411,65 @@ ACTION_OPTIONS = [
 ]
 
 
-def render_te_resolutions(payload, event_id):
-    """Render per-variant action controls for variants in the empty-TM
-    state, and return the payload with user choices applied.
+def apply_te_resolutions(payload, event_id):
+    """Apply user-selected resolutions (stored in session_state under
+    `te_action_<eid>_<cohort>` and `te_tm_input_<eid>_<cohort>` keys) to
+    a fresh payload. Pure function — no UI rendering. Always safe to call:
+    if no resolutions have been submitted, all variants stay as-is.
 
-    The controls are wrapped in a `st.form` per event so that picking a
-    radio option or typing into the text input does NOT trigger a full
-    page rerun. Streamlit only reruns when the user clicks the form's
-    submit button ("Apply resolutions for this event"), at which point
-    every selection in the form is committed to session_state at once.
-    Without the form, every radio click would close all the other
-    expanders and lose UI state.
+    Returns (resolved_payload, n_unresolved). `n_unresolved` counts
+    variants still in the empty-TM state after resolutions (i.e. user
+    chose "Send as-is", or chose "Provide" but didn't type anything)."""
+    new_variants = []
+    unresolved = 0
+    for v in payload["variants"]:
+        if not variant_has_empty_tm(v):
+            new_variants.append(v)
+            continue
+        cohort_id = v.get("_cohort_id") or "unknown"
+        action = st.session_state.get(
+            f"te_action_{event_id}_{cohort_id}", DEFAULT_ACTION
+        )
+        if action == "Omit this variant":
+            continue
+        if action == "Provide TM sections manually":
+            user_sections = (
+                st.session_state.get(f"te_tm_input_{event_id}_{cohort_id}") or ""
+            ).strip()
+            if user_sections:
+                v_resolved = dict(v)
+                v_resolved["mustHave"] = user_sections
+                new_variants.append(v_resolved)
+            else:
+                new_variants.append(v)
+                unresolved += 1
+            continue
+        # Send as-is (default)
+        new_variants.append(v)
+        unresolved += 1
 
-    Three actions per variant:
-      - "Send as-is"               : leave mustHave empty; alert will be
-                                     unfiltered. Counts as unresolved.
-      - "Provide TM sections"      : user types the TM section codes;
-                                     mustHave is replaced with that string.
-      - "Omit this variant"        : variant is dropped from the payload
-                                     entirely so nothing is created.
+    resolved = dict(payload)
+    resolved["variants"] = new_variants
+    return resolved, unresolved
 
-    Resolutions are read from session_state (last submitted values) so
-    they persist across reruns triggered by other interactions (e.g. the
-    Send button, or another event's form submit)."""
+
+def render_te_resolution_form(payload, event_id):
+    """Render the per-variant resolution form for a TE event with empty-TM
+    warnings. Returns True iff the user clicked the form's submit button
+    on this run (the trigger for POSTing this event).
+
+    The form wraps every radio + text input so picks don't trigger reruns.
+    Streamlit only reruns when the form's submit button is clicked, at
+    which point all batched values are committed to session_state and
+    `apply_te_resolutions()` will pick them up on the next render."""
     affected = [v for v in payload["variants"] if variant_has_empty_tm(v)]
     if not affected:
-        return payload, 0
+        return False
 
-    # Render the form. Widgets bound to keys here only push their values
-    # into st.session_state when the form's submit button is clicked.
     with st.form(key=f"resolve_form_{event_id}", clear_on_submit=False):
         st.markdown(
             f"##### {len(affected)} variant(s) need attention — "
-            "pick an action and click **Apply** below"
+            "pick an action and click **Apply & Send** below"
         )
         for v in affected:
             cohort_id = v.get("_cohort_id") or "unknown"
@@ -470,48 +496,11 @@ def render_te_resolutions(payload, event_id):
             )
             st.markdown("---")
 
-        st.form_submit_button(
-            "✅ Apply resolutions for this event",
+        return st.form_submit_button(
+            "✅ Apply & Send to API",
             use_container_width=True,
+            type="primary",
         )
-
-    # Read the last-submitted form values from session_state and
-    # construct the resolved payload. If the user hasn't submitted yet,
-    # the keys hold the initial defaults — same effect as everything
-    # being "Send as-is".
-    new_variants = []
-    unresolved = 0
-    for v in payload["variants"]:
-        if not variant_has_empty_tm(v):
-            new_variants.append(v)
-            continue
-        cohort_id = v.get("_cohort_id") or "unknown"
-        action = st.session_state.get(
-            f"te_action_{event_id}_{cohort_id}", DEFAULT_ACTION
-        )
-        if action == "Omit this variant":
-            continue
-        if action == "Provide TM sections manually":
-            user_sections = (
-                st.session_state.get(f"te_tm_input_{event_id}_{cohort_id}") or ""
-            ).strip()
-            if user_sections:
-                v_resolved = dict(v)
-                v_resolved["mustHave"] = user_sections
-                new_variants.append(v_resolved)
-            else:
-                # Picked "provide" but didn't type anything — still
-                # unresolved.
-                new_variants.append(v)
-                unresolved += 1
-            continue
-        # Send as-is
-        new_variants.append(v)
-        unresolved += 1
-
-    resolved = dict(payload)
-    resolved["variants"] = new_variants
-    return resolved, unresolved
 
 
 def te_soft_warnings(payload):
@@ -582,10 +571,48 @@ def group_rows(all_rows, event_ids):
 
 
 # ---------------------------------------------------------------------------
-# Main logic
+# Workflow state — persists across reruns so form submits don't lose the
+# rendered context.
+#
+# Streamlit reruns the entire script every time the user interacts with a
+# widget. The Preview/Send buttons return True only on the rerun where they
+# were clicked, so we need to remember which one launched the workflow to
+# keep rendering on subsequent reruns (e.g. when a per-event "Apply & Send"
+# form is submitted).
+#
+# Cached POST results live under `te_posted_<eid>` / `sg_posted_<eid>_<kind>`
+# so each event posts at most once per workflow.
 # ---------------------------------------------------------------------------
 
 if preview_btn or send_btn:
+    # Fresh workflow — clear any cached POST results from previous runs
+    # so the user sees current data.
+    for k in list(st.session_state.keys()):
+        if k.startswith("te_posted_") or k.startswith("sg_posted_"):
+            del st.session_state[k]
+    st.session_state["last_action"] = "send" if send_btn else "preview"
+
+last_action = st.session_state.get("last_action")
+# Whether to auto-POST events that have no soft warnings to resolve.
+# Send button → True. Preview button → False (preview-only for healthy).
+trigger_send_for_healthy = (last_action == "send")
+
+
+def _show_post_result(res):
+    """Render a POST result line (success / already-exists / error)."""
+    name = res.get("name", "")
+    status = res.get("status")
+    body = res.get("body", "")
+    processed = res.get("processed", "?")
+    if status == 200:
+        st.success(f"✅ **{name}** — {processed} variants processed")
+    elif status == 400:
+        st.warning(f"⚠️ **{name}** — already exists in destination tool")
+    else:
+        st.error(f"❌ **{name}** — HTTP {status}: {body}")
+
+
+if last_action:
     te_event_ids, te_bad = parse_ids(te_raw_input)
     sg_event_ids, sg_bad = parse_ids(sg_raw_input)
 
@@ -649,56 +676,105 @@ if preview_btn or send_btn:
             )
         st.success(f"Built {len(te_payloads)} TE payload(s) — {ok_count} ready to send")
 
+        # -------------------------------------------------------------------
+        # Per-event preview + POST.
+        # Logic:
+        #   - Blocked: show error, no preview, no POST.
+        #   - Warned: always render preview + resolution form. POST happens
+        #             when the user submits the form ("Apply & Send").
+        #   - Healthy: under SEND, POST immediately (no preview tables).
+        #              Under PREVIEW, render preview only (no POST).
+        # -------------------------------------------------------------------
         for event_id in te_event_ids:
             payload = te_payloads.get(event_id)
             if not payload:
                 continue
             errs  = te_errors.get(event_id, [])
             warns = te_warnings.get(event_id, [])
+            posted_key = f"te_posted_{event_id}"
+            already_posted = posted_key in st.session_state
 
-            badge = ""
+            # ---- Blocked ----
             if errs:
-                badge = "⛔ BLOCKED "
-            elif warns:
-                badge = "⚠️ REVIEW "
-            # Auto-expand when there's anything actionable to look at.
-            with st.expander(f"{badge}**{payload['eventName']}** — {len(payload['variants'])} variants", expanded=bool(errs or warns)):
-                if errs:
+                with st.expander(f"⛔ BLOCKED **{payload['eventName']}** — {len(payload['variants'])} variants", expanded=True):
                     for e in errs:
                         st.error(f"❌ Event {event_id}: {e}")
+                continue
 
-                # Render per-variant resolution controls if any variant
-                # is in the empty-TM state. The function returns a copy
-                # of the payload with the user's choices applied; we
-                # save it back so Send / table / download all use the
-                # resolved version.
-                if warns:
-                    st.markdown("##### ⚠️ Variants that need attention")
-                    payload, unresolved = render_te_resolutions(payload, event_id)
-                    te_payloads[event_id] = payload  # update for Send block
+            # Apply resolutions (no-op if there are none) so tables and the
+            # final POST always reflect the user's choices.
+            resolved_payload, unresolved = apply_te_resolutions(payload, event_id)
+            te_payloads[event_id] = resolved_payload  # keep dict in sync
+
+            # ---- Healthy (no warnings) under SEND: POST immediately, no preview ----
+            if not warns and trigger_send_for_healthy:
+                if not already_posted:
+                    wire = strip_internal_fields(resolved_payload)
+                    with st.spinner(f"Posting event {event_id} to TE API..."):
+                        status, body, processed = post_payload(TE_API_URL, wire)
+                    st.session_state[posted_key] = {
+                        "status": status, "body": body,
+                        "processed": processed, "name": resolved_payload["eventName"],
+                    }
+                _show_post_result(st.session_state[posted_key])
+                continue
+
+            # ---- Warned, OR healthy under PREVIEW: render preview UI ----
+            badge = ""
+            if already_posted:
+                res = st.session_state[posted_key]
+                if res.get("status") == 200:
+                    badge = "✅ SENT "
+                elif res.get("status") == 400:
+                    badge = "⚠️ ALREADY EXISTS "
+                else:
+                    badge = "❌ ERROR "
+            elif warns:
+                badge = "⚠️ REVIEW "
+
+            with st.expander(
+                f"{badge}**{resolved_payload['eventName']}** — {len(resolved_payload['variants'])} variants",
+                expanded=bool(warns and not already_posted),
+            ):
+                # Render the resolution form for warned events that haven't
+                # been posted yet. The form's submit button is the POST
+                # trigger — clicking it commits resolutions AND fires the POST.
+                submitted = False
+                if warns and not already_posted:
+                    submitted = render_te_resolution_form(payload, event_id)
                     if unresolved == 0:
-                        st.success(
-                            f"All {len(warns)} warning(s) resolved. Event "
-                            "is ready to send."
-                        )
+                        st.success(f"All {len(warns)} warning(s) resolved.")
                     else:
                         st.warning(
-                            f"{unresolved} variant(s) still in the empty-TM "
-                            "state. Sending now will create unfiltered alerts "
-                            "for those variants."
+                            f"{unresolved} variant(s) still in the empty-TM state. "
+                            "Sending now will create unfiltered alerts for those."
                         )
 
-                # Recompute splits AFTER resolutions so the tables reflect
-                # the actual payload that will be sent.
-                tickets = [v for v in payload["variants"] if v["variantType"] == 1]
-                parking = [v for v in payload["variants"] if v["variantType"] == 3]
+                # The form_submit reruns the script. On THAT rerun, submitted
+                # is True and resolutions are now in session_state — so
+                # apply_te_resolutions() above already produced the final
+                # resolved_payload reflecting the user's choices.
+                if submitted and not already_posted:
+                    wire = strip_internal_fields(resolved_payload)
+                    with st.spinner(f"Posting event {event_id} to TE API..."):
+                        status, body, processed = post_payload(TE_API_URL, wire)
+                    st.session_state[posted_key] = {
+                        "status": status, "body": body,
+                        "processed": processed, "name": resolved_payload["eventName"],
+                    }
+                    already_posted = True
+
+                if already_posted:
+                    _show_post_result(st.session_state[posted_key])
 
                 m = st.columns(4)
-                m[0].metric("ProductionID", payload["ProductionID"] or "—")
-                m[1].metric("SH Event",     payload["shEventID"] or "—")
-                m[2].metric("SG Event",     payload["sgEventID"] or "—")
-                m[3].metric("Vivid Event",  payload["vividEventID"] or "—")
+                m[0].metric("ProductionID", resolved_payload["ProductionID"] or "—")
+                m[1].metric("SH Event",     resolved_payload["shEventID"] or "—")
+                m[2].metric("SG Event",     resolved_payload["sgEventID"] or "—")
+                m[3].metric("Vivid Event",  resolved_payload["vividEventID"] or "—")
 
+                tickets = [v for v in resolved_payload["variants"] if v["variantType"] == 1]
+                parking = [v for v in resolved_payload["variants"] if v["variantType"] == 3]
                 if tickets:
                     st.markdown(f"**🎫 Ticket Variants** ({len(tickets)})")
                     st.dataframe(
@@ -714,56 +790,37 @@ if preview_btn or send_btn:
 
                 st.download_button(
                     label="⬇️ Download TE payload JSON",
-                    data=json.dumps(strip_internal_fields(payload), indent=2),
-                    file_name=f"event_{payload['ProductionID'] or event_id}_te_payload.json",
+                    data=json.dumps(strip_internal_fields(resolved_payload), indent=2),
+                    file_name=f"event_{resolved_payload['ProductionID'] or event_id}_te_payload.json",
                     mime="application/json",
                     key=f"te_dl_{event_id}",
                 )
 
-        if send_btn and te_payloads:
-            st.subheader("TE API Results")
-            summary = {"success": 0, "already_exists": 0, "error": 0, "skipped": 0}
-            for event_id in te_event_ids:
-                payload = te_payloads.get(event_id)
-                if not payload:
-                    continue
-                if event_id in te_blocked:
-                    reason = "; ".join(te_errors[event_id])
-                    st.error(f"⛔ **Event {event_id}** — skipped (validation): {reason}")
-                    summary["skipped"] += 1
-                    continue
+        # -------------------------------------------------------------------
+        # TE summary metrics — derived from cached POST results so they stay
+        # accurate across reruns.
+        # -------------------------------------------------------------------
+        te_summary = {"success": 0, "already_exists": 0, "error": 0, "blocked": 0, "pending": 0}
+        for event_id in te_event_ids:
+            if event_id in te_blocked:
+                te_summary["blocked"] += 1
+                continue
+            res = st.session_state.get(f"te_posted_{event_id}")
+            if res is None:
+                te_summary["pending"] += 1
+            elif res["status"] == 200:
+                te_summary["success"] += 1
+            elif res["status"] == 400:
+                te_summary["already_exists"] += 1
+            else:
+                te_summary["error"] += 1
 
-                # Recompute warnings against the resolved payload so the
-                # send-time message reflects the user's choices, not the
-                # original raw build.
-                post_resolution_warnings = te_soft_warnings(payload)
-                if post_resolution_warnings:
-                    st.warning(
-                        f"⚠️ **Event {event_id}** — sending despite "
-                        f"{len(post_resolution_warnings)} unresolved warning(s); "
-                        "review the destination tool to confirm the alerts "
-                        "look right."
-                    )
-
-                # Strip internal `_cohort_id` fields before POST so the
-                # destination tool sees a clean payload.
-                wire_payload = strip_internal_fields(payload)
-                status, body, processed = post_payload(TE_API_URL, wire_payload)
-                event_name = payload["eventName"]
-                if status == 200:
-                    st.success(f"✅ **{event_name}** — {processed} variants processed")
-                    summary["success"] += 1
-                elif status == 400:
-                    st.warning(f"⚠️ **{event_name}** — already exists")
-                    summary["already_exists"] += 1
-                else:
-                    st.error(f"❌ **{event_name}** — HTTP {status}: {body}")
-                    summary["error"] += 1
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("✅ Sent",            summary["success"])
-            c2.metric("⚠️ Already Existed", summary["already_exists"])
-            c3.metric("❌ Errors",           summary["error"])
-            c4.metric("⛔ Skipped",          summary["skipped"])
+        cols = st.columns(5)
+        cols[0].metric("✅ Sent",            te_summary["success"])
+        cols[1].metric("⚠️ Already Existed", te_summary["already_exists"])
+        cols[2].metric("❌ Errors",           te_summary["error"])
+        cols[3].metric("⛔ Blocked",          te_summary["blocked"])
+        cols[4].metric("⏳ Pending",          te_summary["pending"])
 
     # -----------------------------------------------------------------------
     # SG tool — two payloads per event (main + parking)
@@ -805,17 +862,54 @@ if preview_btn or send_btn:
             f"{built_parking} parking payload(s)"
         )
 
+        # -------------------------------------------------------------------
+        # Per-event preview + POST. SG has no soft warnings/forms, so the
+        # workflow is simpler than TE:
+        #   - Blocked (per kind): show error, skip POST.
+        #   - Healthy under SEND: POST main+parking immediately (no preview).
+        #   - Healthy under PREVIEW: show preview tables only.
+        # -------------------------------------------------------------------
         for event_id in sg_event_ids:
             bundle = sg_payloads.get(event_id)
             if not bundle:
                 continue
-            main_p = bundle["main"]
+            main_p    = bundle["main"]
             parking_p = bundle["parking"]
-
             errs_main    = sg_errors[event_id]["main"]
             errs_parking = sg_errors[event_id]["parking"]
             any_block = bool(errs_main) or bool(errs_parking)
 
+            posted_main_key    = f"sg_posted_{event_id}_main"
+            posted_parking_key = f"sg_posted_{event_id}_parking"
+
+            # ---- Healthy under SEND: POST inline, skip preview entirely ----
+            if not any_block and trigger_send_for_healthy:
+                # Main
+                if main_p and posted_main_key not in st.session_state:
+                    with st.spinner(f"Posting event {event_id} (main) to SG API..."):
+                        status, body, processed = post_payload(SG_API_URL, main_p)
+                    st.session_state[posted_main_key] = {
+                        "status": status, "body": body, "processed": processed,
+                        "name": f"{main_p['eventName']} [MAIN]",
+                    }
+                if posted_main_key in st.session_state:
+                    _show_post_result(st.session_state[posted_main_key])
+
+                # Parking
+                if parking_p and posted_parking_key not in st.session_state:
+                    with st.spinner(f"Posting event {event_id} (parking) to SG API..."):
+                        status, body, processed = post_payload(SG_API_URL, parking_p)
+                    st.session_state[posted_parking_key] = {
+                        "status": status, "body": body, "processed": processed,
+                        "name": f"{parking_p['eventName']} [PARKING]",
+                    }
+                if posted_parking_key in st.session_state:
+                    _show_post_result(st.session_state[posted_parking_key])
+                elif not parking_p:
+                    st.info(f"⏭️ Event {event_id} — no parking payload to send")
+                continue
+
+            # ---- Otherwise: render preview UI ----
             label = f"**{main_p['eventName']}** — {len(main_p['variants'])} main"
             if parking_p:
                 label += f" + {len(parking_p['variants'])} parking"
@@ -831,6 +925,7 @@ if preview_btn or send_btn:
                 if errs_parking:
                     for e in errs_parking:
                         st.error(f"❌ Event {event_id} [PARKING]: {e}")
+
                 m = st.columns(4)
                 m[0].metric("SG ProductionID", main_p["ProductionID"] or "—")
                 m[1].metric("teEventID",       main_p["teEventID"] or "—")
@@ -878,41 +973,35 @@ if preview_btn or send_btn:
                         "marketplace ID."
                     )
 
-        if send_btn and sg_payloads:
-            st.subheader("SG API Results")
-            summary = {"success": 0, "already_exists": 0, "error": 0, "skipped": 0, "blocked": 0}
-
-            for event_id in sg_event_ids:
+        # -------------------------------------------------------------------
+        # SG summary metrics — derived from cached POST results.
+        # -------------------------------------------------------------------
+        sg_summary = {"success": 0, "already_exists": 0, "error": 0, "blocked": 0, "pending": 0}
+        for event_id in sg_event_ids:
+            for kind, key in (("main", f"sg_posted_{event_id}_main"),
+                              ("parking", f"sg_posted_{event_id}_parking")):
                 bundle = sg_payloads.get(event_id)
-                if not bundle:
+                if bundle is None:
                     continue
+                # Skip parking metric when there's no parking payload for this event.
+                if kind == "parking" and bundle["parking"] is None:
+                    continue
+                if sg_errors[event_id][kind]:
+                    sg_summary["blocked"] += 1
+                    continue
+                res = st.session_state.get(key)
+                if res is None:
+                    sg_summary["pending"] += 1
+                elif res["status"] == 200:
+                    sg_summary["success"] += 1
+                elif res["status"] == 400:
+                    sg_summary["already_exists"] += 1
+                else:
+                    sg_summary["error"] += 1
 
-                for kind, payload in (("main", bundle["main"]), ("parking", bundle["parking"])):
-                    if payload is None:
-                        st.info(f"⏭️ Event {event_id} — no {kind} payload to send")
-                        summary["skipped"] += 1
-                        continue
-                    errs = sg_errors[event_id][kind]
-                    if errs:
-                        reason = "; ".join(errs)
-                        st.error(f"⛔ **Event {event_id} [{kind.upper()}]** — skipped (validation): {reason}")
-                        summary["blocked"] += 1
-                        continue
-                    status, body, processed = post_payload(SG_API_URL, payload)
-                    label = f"{payload['eventName']} [{kind.upper()}]"
-                    if status == 200:
-                        st.success(f"✅ **{label}** — {processed} variants processed")
-                        summary["success"] += 1
-                    elif status == 400:
-                        st.warning(f"⚠️ **{label}** — already exists")
-                        summary["already_exists"] += 1
-                    else:
-                        st.error(f"❌ **{label}** — HTTP {status}: {body}")
-                        summary["error"] += 1
-
-            cols = st.columns(5)
-            cols[0].metric("✅ Sent",            summary["success"])
-            cols[1].metric("⚠️ Already Existed", summary["already_exists"])
-            cols[2].metric("❌ Errors",           summary["error"])
-            cols[3].metric("⛔ Blocked",          summary["blocked"])
-            cols[4].metric("⏭️ Skipped",          summary["skipped"])
+        cols = st.columns(5)
+        cols[0].metric("✅ Sent",            sg_summary["success"])
+        cols[1].metric("⚠️ Already Existed", sg_summary["already_exists"])
+        cols[2].metric("❌ Errors",           sg_summary["error"])
+        cols[3].metric("⛔ Blocked",          sg_summary["blocked"])
+        cols[4].metric("⏳ Pending",          sg_summary["pending"])
