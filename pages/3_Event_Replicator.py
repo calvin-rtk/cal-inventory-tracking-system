@@ -358,80 +358,111 @@ def strip_internal_fields(payload):
     return cleaned
 
 
+DEFAULT_ACTION = "Send as-is (creates empty TE alert)"
+ACTION_OPTIONS = [
+    DEFAULT_ACTION,
+    "Provide TM sections manually",
+    "Omit this variant",
+]
+
+
 def render_te_resolutions(payload, event_id):
     """Render per-variant action controls for variants in the empty-TM
-    state, and return the payload with user choices applied. Three actions
-    per variant:
+    state, and return the payload with user choices applied.
 
-      - "Send as-is"               : leave the empty mustHave; alert will
-                                     be unfiltered. Counts as unresolved.
+    The controls are wrapped in a `st.form` per event so that picking a
+    radio option or typing into the text input does NOT trigger a full
+    page rerun. Streamlit only reruns when the user clicks the form's
+    submit button ("Apply resolutions for this event"), at which point
+    every selection in the form is committed to session_state at once.
+    Without the form, every radio click would close all the other
+    expanders and lose UI state.
+
+    Three actions per variant:
+      - "Send as-is"               : leave mustHave empty; alert will be
+                                     unfiltered. Counts as unresolved.
       - "Provide TM sections"      : user types the TM section codes;
-                                     mustHave is set to that string.
+                                     mustHave is replaced with that string.
       - "Omit this variant"        : variant is dropped from the payload
                                      entirely so nothing is created.
 
-    Streamlit widget keys are scoped per (event_id, cohort_id) so values
-    persist across reruns and stay isolated between events."""
+    Resolutions are read from session_state (last submitted values) so
+    they persist across reruns triggered by other interactions (e.g. the
+    Send button, or another event's form submit)."""
+    affected = [v for v in payload["variants"] if variant_has_empty_tm(v)]
+    if not affected:
+        return payload, 0
+
+    # Render the form. Widgets bound to keys here only push their values
+    # into st.session_state when the form's submit button is clicked.
+    with st.form(key=f"resolve_form_{event_id}", clear_on_submit=False):
+        st.markdown(
+            f"##### {len(affected)} variant(s) need attention — "
+            "pick an action and click **Apply** below"
+        )
+        for v in affected:
+            cohort_id = v.get("_cohort_id") or "unknown"
+            zone = v.get("variantTitle") or "(untitled)"
+            kind = "parking" if v.get("variantType") == 3 else "ticket"
+            sg_sections = v.get("sgMustHaveSection") or ""
+
+            st.markdown(
+                f"⚠️ **Empty TM `mustHave` for {kind} variant `{zone}`** "
+                f"(cohort `{cohort_id}`)"
+            )
+            st.caption(f"SG sections present: `{sg_sections}`")
+
+            st.radio(
+                "How should this variant be handled?",
+                options=ACTION_OPTIONS,
+                key=f"te_action_{event_id}_{cohort_id}",
+                horizontal=True,
+            )
+            st.text_input(
+                "TM sections (only used if you picked 'Provide TM sections manually')",
+                key=f"te_tm_input_{event_id}_{cohort_id}",
+                placeholder="100,101,102",
+            )
+            st.markdown("---")
+
+        st.form_submit_button(
+            "✅ Apply resolutions for this event",
+            use_container_width=True,
+        )
+
+    # Read the last-submitted form values from session_state and
+    # construct the resolved payload. If the user hasn't submitted yet,
+    # the keys hold the initial defaults — same effect as everything
+    # being "Send as-is".
     new_variants = []
     unresolved = 0
-
     for v in payload["variants"]:
         if not variant_has_empty_tm(v):
             new_variants.append(v)
             continue
-
         cohort_id = v.get("_cohort_id") or "unknown"
-        zone = v.get("variantTitle") or "(untitled)"
-        kind = "parking" if v.get("variantType") == 3 else "ticket"
-        sg_sections = v.get("sgMustHaveSection") or ""
-
-        st.markdown(
-            f"⚠️ **Empty TM `mustHave` for {kind} variant `{zone}`** "
-            f"(cohort `{cohort_id}`)"
+        action = st.session_state.get(
+            f"te_action_{event_id}_{cohort_id}", DEFAULT_ACTION
         )
-        st.caption(f"SG sections present: `{sg_sections}`")
-
-        action_key = f"te_action_{event_id}_{cohort_id}"
-        action = st.radio(
-            "How should this variant be handled?",
-            options=[
-                "Send as-is (creates empty TE alert)",
-                "Provide TM sections manually",
-                "Omit this variant",
-            ],
-            key=action_key,
-            horizontal=True,
-        )
-
+        if action == "Omit this variant":
+            continue
         if action == "Provide TM sections manually":
-            input_key = f"te_tm_input_{event_id}_{cohort_id}"
-            user_sections = st.text_input(
-                "TM sections (comma-separated, e.g. `100,101,102`)",
-                key=input_key,
-                placeholder="100,101,102",
+            user_sections = (
+                st.session_state.get(f"te_tm_input_{event_id}_{cohort_id}") or ""
             ).strip()
             if user_sections:
                 v_resolved = dict(v)
                 v_resolved["mustHave"] = user_sections
                 new_variants.append(v_resolved)
-                st.success(
-                    f"✅ '{zone}' will be sent with TM sections: `{user_sections}`"
-                )
             else:
-                st.warning(
-                    "Type the TM sections above, or pick a different action. "
-                    "Leaving this empty keeps the variant in the unresolved state."
-                )
+                # Picked "provide" but didn't type anything — still
+                # unresolved.
                 new_variants.append(v)
                 unresolved += 1
-        elif action == "Omit this variant":
-            st.info(f"🗑️ '{zone}' will be excluded from the TE payload.")
-            # Skip — do not append to new_variants.
-        else:  # Send as-is
-            new_variants.append(v)
-            unresolved += 1
-
-        st.markdown("---")
+            continue
+        # Send as-is
+        new_variants.append(v)
+        unresolved += 1
 
     resolved = dict(payload)
     resolved["variants"] = new_variants
