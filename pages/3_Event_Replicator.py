@@ -46,18 +46,46 @@ def mp_field(marketplaces, name, marketplace_name=None):
     return ""
 
 
-def parse_event_name(start_date_est, event_name):
+# Marker appended to every event name we create. Lets the team identify
+# entries that came from this page when looking at the destination tool.
+ER_SUFFIX = " - ER"
+
+
+def format_event_name(start_date_est, event_name, parking=False):
+    """Format the event name as `YYYY-MM-DD HH:MMAM/PM <name>[ - PARKING] - ER`.
+
+    The DB returns dates like 'Wed April 26, 2026 7:30 PM'. Strip the
+    leading weekday and parse with several known shapes. Date is rendered
+    in 12-hour form with no space before the meridiem suffix
+    (e.g. '2026-05-11 10:30PM') to match the format the destination tools
+    expect. ER suffix is always last so it stays visible regardless of
+    whether the parking marker is present."""
     import re
     from datetime import datetime
+
     raw = (start_date_est or "").strip()
     raw = re.sub(r"^\w+\s+", "", raw, count=1)
+
+    formatted_date = None
     for fmt in ["%B %d, %Y %I:%M %p", "%B %d, %Y %I:%M%p", "%B %d, %Y"]:
         try:
             dt = datetime.strptime(raw, fmt)
-            return f"{dt.strftime('%Y-%m-%d %H:%M:%S')} {event_name}"
+            formatted_date = dt.strftime("%Y-%m-%d %I:%M%p")
+            break
         except ValueError:
             pass
-    return f"{raw} {event_name}"
+
+    head = f"{formatted_date} {event_name}" if formatted_date else f"{raw} {event_name}"
+    if parking:
+        head += " - PARKING"
+    return head + ER_SUFFIX
+
+
+# Backwards-compatible alias — old name retained so any external scripts
+# importing parse_event_name keep working. New code should call
+# format_event_name directly.
+def parse_event_name(start_date_est, event_name):
+    return format_event_name(start_date_est, event_name, parking=False)
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +229,7 @@ def build_sg_parking_payload(event_rows):
     return {
         "ProductionID":     sg_parking_prod,
         "teEventID":        mp_field(mp, "tradedesk"),  # fallback to main TE (TE has one ID for event+parking)
-        "eventName":        parse_event_name(first["start_date_est"], first["rtk_event_name"]) + " - PARKING",
+        "eventName":        format_event_name(first["start_date_est"], first["rtk_event_name"], parking=True),
         "ZHEventID":        mp_field(mp, "PARKING", "zerohero"),
         "shEventID":        mp_field(mp, "PARKING", "stubhub"),
         "sgEventID":        mp_field(mp, "PARKING", "seatgeek"),
@@ -309,6 +337,34 @@ def validate_te(payload):
     return errors
 
 
+def te_soft_warnings(payload):
+    """Return list of soft-warning strings for a TE payload — non-blocking,
+    surfaced for review.
+
+    The big one: a variant where TM `mustHave` is empty but the SG section
+    field is populated. The TE tool builds an alert keyed on the TM field,
+    so this creates an "empty alert" — broad / unfilterable, picks up
+    inventory the cohort never intended to cover. Source of the problem
+    is usually a generic cohort with empty `ticketmaster_sections` upstream
+    in venue-mapping; user can fix there or remove the cohort.
+
+    Format: one warning per affected variant, with cohort/zone name so
+    it's actionable."""
+    warnings = []
+    for v in payload.get("variants", []):
+        if not v.get("mustHave") and v.get("sgMustHaveSection"):
+            kind = "parking" if v.get("variantType") == 3 else "ticket"
+            zone = v.get("variantTitle") or "(untitled)"
+            warnings.append(
+                f"empty TM `mustHave` for {kind} variant '{zone}' — SG sections "
+                f"are present ({v['sgMustHaveSection']}) but no TM sections, so "
+                f"the TE tool will create an empty/unfiltered alert. Decide: "
+                f"fix the upstream generic cohort, remove the cohort manually, "
+                f"or skip this push."
+            )
+    return warnings
+
+
 def validate_sg_main(payload):
     errors = []
     if not payload.get("ProductionID"):
@@ -399,6 +455,10 @@ if preview_btn or send_btn:
         # before they click Send. Errors-by-event keyed for fast lookup.
         te_errors = {eid: validate_te(p) for eid, p in te_payloads.items()}
         te_blocked = {eid for eid, errs in te_errors.items() if errs}
+        # Soft warnings — non-blocking, but surfaced prominently so the user
+        # can decide whether to push, fix upstream, or drop variants.
+        te_warnings = {eid: te_soft_warnings(p) for eid, p in te_payloads.items()}
+        te_warn_count = sum(len(w) for w in te_warnings.values())
 
         ok_count = len(te_payloads) - len(te_blocked)
         if te_blocked:
@@ -407,21 +467,36 @@ if preview_btn or send_btn:
                 f"have blocking errors and will NOT be sent: "
                 f"{sorted(te_blocked)}"
             )
+        if te_warn_count:
+            warned_events = sorted({eid for eid, w in te_warnings.items() if w})
+            st.warning(
+                f"⚠️ {te_warn_count} soft warning(s) across {len(warned_events)} "
+                f"event(s) — review before sending: {warned_events}"
+            )
         st.success(f"Built {len(te_payloads)} TE payload(s) — {ok_count} ready to send")
 
         for event_id in te_event_ids:
             payload = te_payloads.get(event_id)
             if not payload:
                 continue
-            errs = te_errors.get(event_id, [])
+            errs  = te_errors.get(event_id, [])
+            warns = te_warnings.get(event_id, [])
             tickets = [v for v in payload["variants"] if v["variantType"] == 1]
             parking = [v for v in payload["variants"] if v["variantType"] == 3]
 
-            badge = "⛔ BLOCKED " if errs else ""
-            with st.expander(f"{badge}**{payload['eventName']}** — {len(payload['variants'])} variants", expanded=bool(errs)):
+            badge = ""
+            if errs:
+                badge = "⛔ BLOCKED "
+            elif warns:
+                badge = "⚠️ REVIEW "
+            # Auto-expand when there's anything actionable to look at.
+            with st.expander(f"{badge}**{payload['eventName']}** — {len(payload['variants'])} variants", expanded=bool(errs or warns)):
                 if errs:
                     for e in errs:
                         st.error(f"❌ Event {event_id}: {e}")
+                if warns:
+                    for w in warns:
+                        st.warning(f"⚠️ Event {event_id}: {w}")
                 m = st.columns(4)
                 m[0].metric("ProductionID", payload["ProductionID"] or "—")
                 m[1].metric("SH Event",     payload["shEventID"] or "—")
@@ -461,6 +536,14 @@ if preview_btn or send_btn:
                     st.error(f"⛔ **Event {event_id}** — skipped (validation): {reason}")
                     summary["skipped"] += 1
                     continue
+                # Send-time reminder if soft warnings are present. We still
+                # POST — soft warnings are informational, not blocking.
+                if te_warnings.get(event_id):
+                    st.warning(
+                        f"⚠️ **Event {event_id}** — sending despite "
+                        f"{len(te_warnings[event_id])} soft warning(s); review "
+                        f"the destination tool to confirm the alerts look right."
+                    )
                 status, body, processed = post_payload(TE_API_URL, payload)
                 event_name = payload["eventName"]
                 if status == 200:
