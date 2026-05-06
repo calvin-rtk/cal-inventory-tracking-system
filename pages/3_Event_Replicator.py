@@ -131,6 +131,9 @@ def build_payload(event_rows):
     for r in event_rows:
         is_parking = r["is_parking"]
         payload["variants"].append({
+            # Internal-only key (stripped before POST). Used as a stable
+            # identifier for per-variant resolution widgets in the UI.
+            "_cohort_id":         r.get("cohort_id"),
             "variantTitle":       r["variant_title"] or "",
             "variantType":        3 if is_parking else 1,
             "maxBuyPrice":        7,
@@ -337,6 +340,104 @@ def validate_te(payload):
     return errors
 
 
+def variant_has_empty_tm(v):
+    """A variant is in the 'empty TM alert' state when mustHave (TM) is
+    empty but sgMustHaveSection is populated — the alert that gets created
+    has no TM filter, which is almost always wrong."""
+    return (not v.get("mustHave")) and bool(v.get("sgMustHaveSection"))
+
+
+def strip_internal_fields(payload):
+    """Return a copy of the payload with internal-only keys (prefixed `_`)
+    removed from variants so it can be POSTed cleanly."""
+    cleaned = dict(payload)
+    cleaned["variants"] = [
+        {k: val for k, val in var.items() if not k.startswith("_")}
+        for var in payload["variants"]
+    ]
+    return cleaned
+
+
+def render_te_resolutions(payload, event_id):
+    """Render per-variant action controls for variants in the empty-TM
+    state, and return the payload with user choices applied. Three actions
+    per variant:
+
+      - "Send as-is"               : leave the empty mustHave; alert will
+                                     be unfiltered. Counts as unresolved.
+      - "Provide TM sections"      : user types the TM section codes;
+                                     mustHave is set to that string.
+      - "Omit this variant"        : variant is dropped from the payload
+                                     entirely so nothing is created.
+
+    Streamlit widget keys are scoped per (event_id, cohort_id) so values
+    persist across reruns and stay isolated between events."""
+    new_variants = []
+    unresolved = 0
+
+    for v in payload["variants"]:
+        if not variant_has_empty_tm(v):
+            new_variants.append(v)
+            continue
+
+        cohort_id = v.get("_cohort_id") or "unknown"
+        zone = v.get("variantTitle") or "(untitled)"
+        kind = "parking" if v.get("variantType") == 3 else "ticket"
+        sg_sections = v.get("sgMustHaveSection") or ""
+
+        st.markdown(
+            f"⚠️ **Empty TM `mustHave` for {kind} variant `{zone}`** "
+            f"(cohort `{cohort_id}`)"
+        )
+        st.caption(f"SG sections present: `{sg_sections}`")
+
+        action_key = f"te_action_{event_id}_{cohort_id}"
+        action = st.radio(
+            "How should this variant be handled?",
+            options=[
+                "Send as-is (creates empty TE alert)",
+                "Provide TM sections manually",
+                "Omit this variant",
+            ],
+            key=action_key,
+            horizontal=True,
+        )
+
+        if action == "Provide TM sections manually":
+            input_key = f"te_tm_input_{event_id}_{cohort_id}"
+            user_sections = st.text_input(
+                "TM sections (comma-separated, e.g. `100,101,102`)",
+                key=input_key,
+                placeholder="100,101,102",
+            ).strip()
+            if user_sections:
+                v_resolved = dict(v)
+                v_resolved["mustHave"] = user_sections
+                new_variants.append(v_resolved)
+                st.success(
+                    f"✅ '{zone}' will be sent with TM sections: `{user_sections}`"
+                )
+            else:
+                st.warning(
+                    "Type the TM sections above, or pick a different action. "
+                    "Leaving this empty keeps the variant in the unresolved state."
+                )
+                new_variants.append(v)
+                unresolved += 1
+        elif action == "Omit this variant":
+            st.info(f"🗑️ '{zone}' will be excluded from the TE payload.")
+            # Skip — do not append to new_variants.
+        else:  # Send as-is
+            new_variants.append(v)
+            unresolved += 1
+
+        st.markdown("---")
+
+    resolved = dict(payload)
+    resolved["variants"] = new_variants
+    return resolved, unresolved
+
+
 def te_soft_warnings(payload):
     """Return list of soft-warning strings for a TE payload — non-blocking,
     surfaced for review.
@@ -352,15 +453,12 @@ def te_soft_warnings(payload):
     it's actionable."""
     warnings = []
     for v in payload.get("variants", []):
-        if not v.get("mustHave") and v.get("sgMustHaveSection"):
+        if variant_has_empty_tm(v):
             kind = "parking" if v.get("variantType") == 3 else "ticket"
             zone = v.get("variantTitle") or "(untitled)"
             warnings.append(
                 f"empty TM `mustHave` for {kind} variant '{zone}' — SG sections "
-                f"are present ({v['sgMustHaveSection']}) but no TM sections, so "
-                f"the TE tool will create an empty/unfiltered alert. Decide: "
-                f"fix the upstream generic cohort, remove the cohort manually, "
-                f"or skip this push."
+                f"are present ({v['sgMustHaveSection']}) but no TM sections."
             )
     return warnings
 
@@ -481,8 +579,6 @@ if preview_btn or send_btn:
                 continue
             errs  = te_errors.get(event_id, [])
             warns = te_warnings.get(event_id, [])
-            tickets = [v for v in payload["variants"] if v["variantType"] == 1]
-            parking = [v for v in payload["variants"] if v["variantType"] == 3]
 
             badge = ""
             if errs:
@@ -494,9 +590,33 @@ if preview_btn or send_btn:
                 if errs:
                     for e in errs:
                         st.error(f"❌ Event {event_id}: {e}")
+
+                # Render per-variant resolution controls if any variant
+                # is in the empty-TM state. The function returns a copy
+                # of the payload with the user's choices applied; we
+                # save it back so Send / table / download all use the
+                # resolved version.
                 if warns:
-                    for w in warns:
-                        st.warning(f"⚠️ Event {event_id}: {w}")
+                    st.markdown("##### ⚠️ Variants that need attention")
+                    payload, unresolved = render_te_resolutions(payload, event_id)
+                    te_payloads[event_id] = payload  # update for Send block
+                    if unresolved == 0:
+                        st.success(
+                            f"All {len(warns)} warning(s) resolved. Event "
+                            "is ready to send."
+                        )
+                    else:
+                        st.warning(
+                            f"{unresolved} variant(s) still in the empty-TM "
+                            "state. Sending now will create unfiltered alerts "
+                            "for those variants."
+                        )
+
+                # Recompute splits AFTER resolutions so the tables reflect
+                # the actual payload that will be sent.
+                tickets = [v for v in payload["variants"] if v["variantType"] == 1]
+                parking = [v for v in payload["variants"] if v["variantType"] == 3]
+
                 m = st.columns(4)
                 m[0].metric("ProductionID", payload["ProductionID"] or "—")
                 m[1].metric("SH Event",     payload["shEventID"] or "—")
@@ -504,13 +624,13 @@ if preview_btn or send_btn:
                 m[3].metric("Vivid Event",  payload["vividEventID"] or "—")
 
                 if tickets:
-                    st.markdown("**🎫 Ticket Variants**")
+                    st.markdown(f"**🎫 Ticket Variants** ({len(tickets)})")
                     st.dataframe(
                         [{"Zone": v["variantTitle"], "mustHave": v["mustHave"], "sgMustHave": v["sgMustHaveSection"]} for v in tickets],
                         use_container_width=True, hide_index=True,
                     )
                 if parking:
-                    st.markdown("**🚗 Parking Variants**")
+                    st.markdown(f"**🚗 Parking Variants** ({len(parking)})")
                     st.dataframe(
                         [{"Zone": v["variantTitle"], "mustHave": v["mustHave"], "sgMustHave": v["sgMustHaveSection"]} for v in parking],
                         use_container_width=True, hide_index=True,
@@ -518,7 +638,7 @@ if preview_btn or send_btn:
 
                 st.download_button(
                     label="⬇️ Download TE payload JSON",
-                    data=json.dumps(payload, indent=2),
+                    data=json.dumps(strip_internal_fields(payload), indent=2),
                     file_name=f"event_{payload['ProductionID'] or event_id}_te_payload.json",
                     mime="application/json",
                     key=f"te_dl_{event_id}",
@@ -536,15 +656,23 @@ if preview_btn or send_btn:
                     st.error(f"⛔ **Event {event_id}** — skipped (validation): {reason}")
                     summary["skipped"] += 1
                     continue
-                # Send-time reminder if soft warnings are present. We still
-                # POST — soft warnings are informational, not blocking.
-                if te_warnings.get(event_id):
+
+                # Recompute warnings against the resolved payload so the
+                # send-time message reflects the user's choices, not the
+                # original raw build.
+                post_resolution_warnings = te_soft_warnings(payload)
+                if post_resolution_warnings:
                     st.warning(
                         f"⚠️ **Event {event_id}** — sending despite "
-                        f"{len(te_warnings[event_id])} soft warning(s); review "
-                        f"the destination tool to confirm the alerts look right."
+                        f"{len(post_resolution_warnings)} unresolved warning(s); "
+                        "review the destination tool to confirm the alerts "
+                        "look right."
                     )
-                status, body, processed = post_payload(TE_API_URL, payload)
+
+                # Strip internal `_cohort_id` fields before POST so the
+                # destination tool sees a clean payload.
+                wire_payload = strip_internal_fields(payload)
+                status, body, processed = post_payload(TE_API_URL, wire_payload)
                 event_name = payload["eventName"]
                 if status == 200:
                     st.success(f"✅ **{event_name}** — {processed} variants processed")
