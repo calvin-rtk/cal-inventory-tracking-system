@@ -4,7 +4,10 @@ Event Replicator — batch build and send event payloads to the TE API.
 
 import json
 import os
+import subprocess
 from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 import streamlit as st
@@ -19,8 +22,50 @@ st.set_page_config(
     layout="wide",
 )
 
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_last_updated():
+    """Return a human-readable 'last updated' line for the deployed page.
+
+    Tries `git log` first so the user sees the actual commit author and
+    timestamp from the repo. Falls back to the page file's mtime if git
+    isn't available (e.g. some container deploys strip the .git dir).
+
+    Cached for 5 minutes so the subprocess only runs occasionally.
+    Returns a string ready to drop into st.caption()."""
+    repo_root = Path(__file__).resolve().parent.parent
+    try:
+        out = subprocess.check_output(
+            [
+                "git", "-C", str(repo_root), "log", "-1",
+                "--format=%h|%an|%cI|%s",
+            ],
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        ).decode("utf-8").strip()
+        sha, author, iso_date, subject = out.split("|", 3)
+        try:
+            ts = datetime.fromisoformat(iso_date).astimezone()
+            when = ts.strftime("%Y-%m-%d %I:%M%p")
+        except ValueError:
+            when = iso_date
+        # Truncate long subjects so the caption stays one tidy line.
+        if len(subject) > 70:
+            subject = subject[:67] + "..."
+        return f"🕒 Last updated **{when}** by **{author}** — `{sha}` · {subject}"
+    except Exception:
+        # Fallback: file mtime. No author available.
+        try:
+            mtime = Path(__file__).stat().st_mtime
+            ts = datetime.fromtimestamp(mtime, tz=timezone.utc).astimezone()
+            return f"🕒 Last updated **{ts.strftime('%Y-%m-%d %I:%M%p')}** (file mtime; git unavailable)"
+        except Exception:
+            return "🕒 Last updated: unknown"
+
+
 st.title("🎟️ Event Replicator")
 st.caption("Build and send event payloads to the TE API.")
+st.caption(get_last_updated())
 
 # ---------------------------------------------------------------------------
 # Go service base URL — reads from Streamlit secrets, falls back to env var
